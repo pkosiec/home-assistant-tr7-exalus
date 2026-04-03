@@ -44,7 +44,7 @@ _LOGGER = logging.getLogger(__name__)
 PLATFORMS = [Platform.COVER]
 MOVEMENT_OPENING = "opening"
 MOVEMENT_CLOSING = "closing"
-MOVEMENT_STATE_TIMEOUT = timedelta(seconds=90)
+MOVEMENT_STATE_TIMEOUT = timedelta(seconds=30)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -102,6 +102,8 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         self._last_command_time: datetime | None = None
         self._command_delay = 0.5  # 500ms base delay between commands
         self._timeout_count = 0
+        self._movement_expiry_handles: dict[str, asyncio.TimerHandle] = {}
+        self._pending_movement_commands: dict[str, dict[str, Any]] = {}
 
         # Session health monitoring
         self._session_start_time: datetime | None = None
@@ -130,6 +132,170 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         device_data["movement_state"] = None
         device_data["target_position"] = None
         device_data["movement_started_at"] = None
+
+    @staticmethod
+    def _copy_device_movement(device_data: dict[str, Any] | None) -> dict[str, Any]:
+        """Copy derived movement metadata for a device."""
+        if device_data is None:
+            return {
+                "movement_state": None,
+                "target_position": None,
+                "movement_started_at": None,
+            }
+
+        return {
+            "movement_state": device_data.get("movement_state"),
+            "target_position": device_data.get("target_position"),
+            "movement_started_at": device_data.get("movement_started_at"),
+        }
+
+    def _restore_device_movement(
+        self,
+        device_guid: str,
+        movement_snapshot: dict[str, Any],
+    ) -> None:
+        """Restore derived movement metadata for a device."""
+        device_data = self.devices.get(device_guid)
+        if device_data is None:
+            return
+
+        device_data["movement_state"] = movement_snapshot.get("movement_state")
+        device_data["target_position"] = movement_snapshot.get("target_position")
+        device_data["movement_started_at"] = movement_snapshot.get("movement_started_at")
+
+    def _remember_pending_movement_command(
+        self,
+        transaction_id: str,
+        device_guid: str,
+        action: str,
+    ) -> None:
+        """Track an optimistic movement update until TR7 responds."""
+        self._pending_movement_commands[transaction_id] = {
+            "action": action,
+            "device_guid": device_guid,
+            "optimistic_applied": False,
+            "response_status": None,
+            "restore_state": self._copy_device_movement(self.devices.get(device_guid)),
+        }
+
+    def _record_pending_movement_response(
+        self,
+        transaction_id: str,
+        status: int | None,
+    ) -> None:
+        """Record the TR7 response for a tracked optimistic movement update."""
+        pending_command = self._pending_movement_commands.get(transaction_id)
+        if pending_command is None:
+            return
+
+        if status is None:
+            return
+
+        pending_command["response_status"] = status
+        if status == 0:
+            if pending_command["optimistic_applied"]:
+                self._pending_movement_commands.pop(transaction_id, None)
+            return
+
+        if pending_command["optimistic_applied"]:
+            self._rollback_pending_movement_command(transaction_id, status)
+
+    def _rollback_pending_movement_command(
+        self,
+        transaction_id: str,
+        status: int | None,
+    ) -> None:
+        """Rollback a rejected optimistic movement update."""
+        pending_command = self._pending_movement_commands.pop(transaction_id, None)
+        if pending_command is None:
+            return
+
+        if not pending_command["optimistic_applied"]:
+            return
+
+        device_guid = pending_command["device_guid"]
+        self._restore_device_movement(device_guid, pending_command["restore_state"])
+        self._sync_device_movement_expiry(device_guid)
+
+        _LOGGER.warning(
+            "Rolling back optimistic %s for device %s after TR7 response status %s",
+            pending_command["action"],
+            device_guid[-8:],
+            status,
+        )
+        self.async_set_updated_data(self.devices)
+
+    def _cancel_device_movement_expiry(self, device_guid: str) -> None:
+        """Cancel any pending movement expiry callback for a device."""
+        expiry_handle = self._movement_expiry_handles.pop(device_guid, None)
+        if expiry_handle is not None:
+            expiry_handle.cancel()
+
+    def _expire_device_movement(
+        self,
+        device_guid: str,
+        expected_started_at: datetime,
+    ) -> None:
+        """Clear stale movement state and publish the update."""
+        device_data = self.devices.get(device_guid)
+        if device_data is None:
+            self._cancel_device_movement_expiry(device_guid)
+            return
+
+        current_started_at = device_data.get("movement_started_at")
+        if current_started_at != expected_started_at:
+            self._sync_device_movement_expiry(device_guid)
+            return
+
+        if not self._is_movement_state_stale(device_data):
+            self._sync_device_movement_expiry(device_guid)
+            return
+
+        _LOGGER.debug(
+            "Movement state timeout expired for device %s",
+            device_data.get("guid", "unknown"),
+        )
+        self._clear_device_movement(device_data)
+        self._cancel_device_movement_expiry(device_guid)
+        self.async_set_updated_data(self.devices)
+
+    def _sync_device_movement_expiry(self, device_guid: str) -> None:
+        """Ensure a device's movement expiry callback matches current state."""
+        device_data = self.devices.get(device_guid)
+        if device_data is None:
+            self._cancel_device_movement_expiry(device_guid)
+            return
+
+        movement_state = device_data.get("movement_state")
+        started_at = device_data.get("movement_started_at")
+        if movement_state is None or not isinstance(started_at, datetime):
+            self._cancel_device_movement_expiry(device_guid)
+            return
+
+        delay = (
+            started_at + MOVEMENT_STATE_TIMEOUT - datetime.now()
+        ).total_seconds()
+        if delay <= 0:
+            self._expire_device_movement(device_guid, started_at)
+            return
+
+        self._cancel_device_movement_expiry(device_guid)
+        self._movement_expiry_handles[device_guid] = self.hass.loop.call_later(
+            delay,
+            self._expire_device_movement,
+            device_guid,
+            started_at,
+        )
+
+    def _sync_all_movement_expiry(self) -> None:
+        """Reconcile all movement expiry callbacks with current devices."""
+        active_device_guids = set(self.devices)
+        for device_guid in list(self._movement_expiry_handles):
+            if device_guid not in active_device_guids:
+                self._cancel_device_movement_expiry(device_guid)
+
+        for device_guid in active_device_guids:
+            self._sync_device_movement_expiry(device_guid)
 
     @staticmethod
     def _movement_target_reached(
@@ -166,12 +332,8 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             self._clear_device_movement(device_data)
 
     def get_device_data(self, device_guid: str) -> dict[str, Any] | None:
-        """Return device data with derived movement state refreshed."""
-        device_data = self.devices.get(device_guid)
-        if device_data is None:
-            return None
-        self._refresh_device_movement_state(device_data)
-        return device_data
+        """Return device data for a device."""
+        return self.devices.get(device_guid)
 
     def get_cover_movement_state(self, device_guid: str) -> str | None:
         """Return the derived Home Assistant movement state for a cover."""
@@ -272,6 +434,16 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                 target_position,
             ):
                 self._clear_device_movement(updated)
+            return updated
+
+        if (
+            not allow_delta_inference
+            and updated.get("movement_state") is not None
+            and previous_ha_position is not None
+            and current_position is not None
+            and current_position != previous_ha_position
+        ):
+            updated["movement_started_at"] = datetime.now()
             return updated
 
         self._refresh_device_movement_state(updated)
@@ -677,6 +849,13 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                     _LOGGER.warning("🎯 API DISCOVERY RESPONSE: Resource=%s, Status=%s, TransactionId=%s, Data=%s",
                                   resource, status, transaction_id, data.get("Data"))
 
+                    if resource in {
+                        RESOURCE_DEVICE_CONTROL,
+                        RESOURCE_DEVICE_POSITION,
+                        RESOURCE_DEVICE_STOP,
+                    }:
+                        self._record_pending_movement_response(transaction_id, status)
+
                     # Reset timeout count on successful device control commands
                     if resource in {RESOURCE_DEVICE_CONTROL, RESOURCE_DEVICE_POSITION, RESOURCE_DEVICE_STOP} and status == 0:
                         if self._timeout_count > 0:
@@ -788,6 +967,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                 )
 
             self.devices = new_devices
+            self._sync_all_movement_expiry()
 
             # Notify listeners of new device data
             self.async_set_updated_data(self.devices)
@@ -818,6 +998,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                 state,
                 allow_delta_inference=True,
             )
+            self._sync_device_movement_expiry(device_guid)
 
             # Reset empty list counter when a state change arrives
             self._empty_device_states = 0
@@ -882,69 +1063,102 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             # Get device info to include Channel if available
             device_info = self.devices.get(device_guid, {})
             channel = device_info.get("channel", 1)  # Default to channel 1
+            transaction_id, message = self._build_position_command(
+                device_guid,
+                position,
+                channel,
+            )
 
             _LOGGER.info("Setting position for device %s to %s (channel %s)", device_guid, position, channel)
+            self._remember_pending_movement_command(
+                transaction_id,
+                device_guid,
+                f"position command to {position}%",
+            )
+            try:
+                await self._send_device_control_message(message)
+            except Exception:
+                self._pending_movement_commands.pop(transaction_id, None)
+                raise
 
-            # Start with the most likely working endpoint based on TR7 traffic analysis
-            await self._send_position_command(device_guid, position, channel)
+            pending_command = self._pending_movement_commands.get(transaction_id)
+            if pending_command is None:
+                return
+
+            response_status = pending_command.get("response_status")
+            if response_status not in (None, 0):
+                self._rollback_pending_movement_command(transaction_id, response_status)
+                return
+
+            pending_command["optimistic_applied"] = True
             self._set_command_movement_state(device_guid, position)
+            self._sync_device_movement_expiry(device_guid)
             self.async_set_updated_data(self.devices)
+            if pending_command.get("response_status") == 0:
+                self._pending_movement_commands.pop(transaction_id, None)
 
         except Exception as err:
             _LOGGER.error("Error setting position for device %s: %s", device_guid, err)
             raise
 
-    async def _send_position_command(self, device_guid: str, position: int, channel: int) -> None:
-        """Send position command using the correct TR7 API format."""
-        # Ensure connection/auth before sending
+    def _build_position_command(
+        self,
+        device_guid: str,
+        position: int,
+        channel: int,
+    ) -> tuple[str, dict[str, Any]]:
+        """Build a TR7 position command."""
+        transaction_id = str(uuid.uuid4())
+
+        # Convert HA position (0-100) to TR7 command codes
+        # Based on original app: 101 = open (100%), 102 = close (0%)
+        # TR7 uses inverted position scale: 0=open, 100=closed (opposite of HA)
+        if position == 100:
+            control_data = 101  # Open command
+        elif position == 0:
+            control_data = 102  # Close command
+        else:
+            # For intermediate positions, invert the scale
+            # HA 85% open = TR7 15 (since TR7: 0=open, 100=closed)
+            control_data = 100 - position
+
+        message = {
+            "TransactionId": transaction_id,
+            "Resource": RESOURCE_DEVICE_CONTROL,
+            "Method": METHOD_POST,
+            "Data": {
+                "DeviceGuid": device_guid,
+                "Channel": channel,
+                "ControlFeature": 3,
+                "SequnceExecutionOrder": 0,
+                "Data": control_data,
+            },
+        }
+
+        _LOGGER.info(
+            "Sending TR7 position command: device=%s, position=%s, control_data=%s",
+            device_guid[-8:],
+            position,
+            control_data,
+        )
+        _LOGGER.debug("Full command: %s", message)
+        return transaction_id, message
+
+    async def _send_device_control_message(self, message: dict[str, Any]) -> None:
+        """Send a device control message with reconnect/retry handling."""
         await self._ensure_connected_and_authenticated()
         try:
-            transaction_id = str(uuid.uuid4())
-
-            # Convert HA position (0-100) to TR7 command codes
-            # Based on original app: 101 = open (100%), 102 = close (0%)
-            # TR7 uses inverted position scale: 0=open, 100=closed (opposite of HA)
-            if position == 100:
-                control_data = 101  # Open command
-            elif position == 0:
-                control_data = 102  # Close command
-            else:
-                # For intermediate positions, invert the scale
-                # HA 85% open = TR7 15 (since TR7: 0=open, 100=closed)
-                control_data = 100 - position
-
-            # Use the exact format from the original app
-            message = {
-                "TransactionId": transaction_id,
-                "Resource": RESOURCE_DEVICE_CONTROL,
-                "Method": METHOD_POST,
-                "Data": {
-                    "DeviceGuid": device_guid,
-                    "Channel": channel,
-                    "ControlFeature": 3,
-                    "SequnceExecutionOrder": 0,
-                    "Data": control_data
-                }
-            }
-
-            _LOGGER.info("Sending TR7 position command: device=%s, position=%s, control_data=%s",
-                        device_guid[-8:], position, control_data)
-            _LOGGER.debug("Full command: %s", message)
             await self._send_message(message)
-
-            # Give some time for the command to be processed
             await asyncio.sleep(0.5)
-
         except UpdateFailed as err:
-            _LOGGER.warning("Position command failed, attempting re-auth and retry: %s", err)
-            # Force re-auth and retry once
+            _LOGGER.warning("Device control command failed, attempting re-auth and retry: %s", err)
             self.authenticated = False
             self._last_auth_time = None
             await self._ensure_connected_and_authenticated()
             await self._send_message(message)
             await asyncio.sleep(0.5)
         except Exception as err:
-            _LOGGER.error("Failed to send position command: %s", err)
+            _LOGGER.error("Failed to send device control command: %s", err)
             raise
 
     async def open_cover(self, device_guid: str) -> None:
@@ -957,49 +1171,64 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
 
     async def stop_cover(self, device_guid: str) -> None:
         """Stop cover movement."""
-        # Ensure connection/auth before sending
-        await self._ensure_connected_and_authenticated()
         try:
-            transaction_id = str(uuid.uuid4())
             device_info = self.devices.get(device_guid, {})
             channel = device_info.get("channel", 1)
-
-            # Use the exact TR7 API format for stop command
-            # Based on original app: Data: 103 = stop command
-            message = {
-                "TransactionId": transaction_id,
-                "Resource": RESOURCE_DEVICE_CONTROL,
-                "Method": METHOD_POST,
-                "Data": {
-                    "DeviceGuid": device_guid,
-                    "Channel": channel,
-                    "ControlFeature": 3,
-                    "SequnceExecutionOrder": 0,
-                    "Data": 103  # Stop command from original app
-                }
-            }
+            transaction_id, message = self._build_stop_command(device_guid, channel)
 
             _LOGGER.info("Stopping device %s (channel %s)", device_guid[-8:], channel)
             _LOGGER.debug("Stop command: %s", message)
-            await self._send_message(message)
-            device_data = self.devices.get(device_guid)
-            if device_data is not None:
-                self._clear_device_movement(device_data)
-                self.async_set_updated_data(self.devices)
+            self._remember_pending_movement_command(
+                transaction_id,
+                device_guid,
+                "stop command",
+            )
+            try:
+                await self._send_device_control_message(message)
+            except Exception:
+                self._pending_movement_commands.pop(transaction_id, None)
+                raise
 
-        except UpdateFailed as err:
-            _LOGGER.warning("Stop command failed, attempting re-auth and retry: %s", err)
-            self.authenticated = False
-            self._last_auth_time = None
-            await self._ensure_connected_and_authenticated()
-            await self._send_message(message)
+            pending_command = self._pending_movement_commands.get(transaction_id)
+            if pending_command is None:
+                return
+
+            response_status = pending_command.get("response_status")
+            if response_status not in (None, 0):
+                self._rollback_pending_movement_command(transaction_id, response_status)
+                return
+
+            pending_command["optimistic_applied"] = True
             device_data = self.devices.get(device_guid)
             if device_data is not None:
                 self._clear_device_movement(device_data)
+                self._sync_device_movement_expiry(device_guid)
                 self.async_set_updated_data(self.devices)
+            if pending_command.get("response_status") == 0:
+                self._pending_movement_commands.pop(transaction_id, None)
         except Exception as err:
             _LOGGER.error("Error stopping cover for device %s: %s", device_guid, err)
             raise
+
+    def _build_stop_command(
+        self,
+        device_guid: str,
+        channel: int,
+    ) -> tuple[str, dict[str, Any]]:
+        """Build a TR7 stop command."""
+        transaction_id = str(uuid.uuid4())
+        return transaction_id, {
+            "TransactionId": transaction_id,
+            "Resource": RESOURCE_DEVICE_CONTROL,
+            "Method": METHOD_POST,
+            "Data": {
+                "DeviceGuid": device_guid,
+                "Channel": channel,
+                "ControlFeature": 3,
+                "SequnceExecutionOrder": 0,
+                "Data": 103,
+            },
+        }
 
     async def close(self) -> None:
         """Close WebSocket connection."""
@@ -1016,6 +1245,10 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                 await self._auth_refresh_task
             except asyncio.CancelledError:
                 pass
+
+        for device_guid in list(self._movement_expiry_handles):
+            self._cancel_device_movement_expiry(device_guid)
+        self._pending_movement_commands.clear()
 
         if self.websocket:
             try:
