@@ -103,7 +103,8 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         self._command_delay = 0.5  # 500ms base delay between commands
         self._timeout_count = 0
         self._movement_expiry_handles: dict[str, asyncio.TimerHandle] = {}
-        self._pending_movement_commands: dict[str, dict[str, Any]] = {}
+        self._pending_device_commands: dict[str, dict[str, Any]] = {}
+        self._pending_command_devices: dict[str, str] = {}
 
         # Session health monitoring
         self._session_start_time: datetime | None = None
@@ -132,94 +133,180 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         device_data["movement_state"] = None
         device_data["target_position"] = None
         device_data["movement_started_at"] = None
+        device_data["last_position_change_at"] = None
 
     @staticmethod
-    def _copy_device_movement(device_data: dict[str, Any] | None) -> dict[str, Any]:
-        """Copy derived movement metadata for a device."""
-        if device_data is None:
-            return {
-                "movement_state": None,
-                "target_position": None,
-                "movement_started_at": None,
-            }
+    def _movement_freshness_time(device_data: dict[str, Any]) -> datetime | None:
+        """Return the most recent timestamp that should keep movement alive."""
+        freshness_at = device_data.get("last_position_change_at")
+        if isinstance(freshness_at, datetime):
+            return freshness_at
 
-        return {
-            "movement_state": device_data.get("movement_state"),
-            "target_position": device_data.get("target_position"),
-            "movement_started_at": device_data.get("movement_started_at"),
-        }
+        started_at = device_data.get("movement_started_at")
+        if isinstance(started_at, datetime):
+            return started_at
+        return None
 
-    def _restore_device_movement(
+    def _clear_pending_device_command(
         self,
         device_guid: str,
-        movement_snapshot: dict[str, Any],
+        expected_transaction_id: str | None = None,
     ) -> None:
-        """Restore derived movement metadata for a device."""
+        """Clear the pending command for a device if it still matches."""
+        pending_command = self._pending_device_commands.get(device_guid)
+        if pending_command is None:
+            return
+
+        transaction_id = pending_command.get("transaction_id")
+        if (
+            expected_transaction_id is not None
+            and transaction_id != expected_transaction_id
+        ):
+            return
+
+        self._pending_device_commands.pop(device_guid, None)
+        if transaction_id is not None:
+            self._pending_command_devices.pop(transaction_id, None)
+
+    def _remember_pending_device_command(
+        self,
+        device_guid: str,
+        transaction_id: str,
+        *,
+        command_kind: str,
+        target_position: int | None = None,
+    ) -> None:
+        """Track the latest optimistic command for a device."""
+        existing_pending = self._pending_device_commands.get(device_guid)
+        device_data = self.devices.get(device_guid, {})
+        previous_movement_state = device_data.get("movement_state")
+        previous_target_position = device_data.get("target_position")
+        previous_movement_started_at = device_data.get("movement_started_at")
+        previous_last_position_change_at = device_data.get("last_position_change_at")
+
+        if (
+            existing_pending is not None
+            and not existing_pending.get("movement_observed")
+            and existing_pending.get("response_status") not in (0, 10)
+        ):
+            previous_movement_state = existing_pending.get("previous_movement_state")
+            previous_target_position = existing_pending.get("previous_target_position")
+            previous_movement_started_at = existing_pending.get("previous_movement_started_at")
+            previous_last_position_change_at = existing_pending.get("previous_last_position_change_at")
+
+        self._clear_pending_device_command(device_guid)
+        issued_at = datetime.now()
+        self._pending_device_commands[device_guid] = {
+            "transaction_id": transaction_id,
+            "command_kind": command_kind,
+            "target_position": target_position,
+            "issued_at": issued_at,
+            "movement_observed": False,
+            "optimistic_applied": False,
+            "response_status": None,
+            "previous_movement_state": previous_movement_state,
+            "previous_target_position": previous_target_position,
+            "previous_movement_started_at": previous_movement_started_at,
+            "previous_last_position_change_at": previous_last_position_change_at,
+        }
+        self._pending_command_devices[transaction_id] = device_guid
+
+    def _get_pending_device_command(
+        self,
+        transaction_id: str,
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Return the current pending command that matches a transaction."""
+        device_guid = self._pending_command_devices.get(transaction_id)
+        if device_guid is None:
+            return None
+
+        pending_command = self._pending_device_commands.get(device_guid)
+        if pending_command is None:
+            self._pending_command_devices.pop(transaction_id, None)
+            return None
+
+        if pending_command.get("transaction_id") != transaction_id:
+            self._pending_command_devices.pop(transaction_id, None)
+            return None
+
+        return device_guid, pending_command
+
+    def _handle_pending_command_response(
+        self,
+        transaction_id: str,
+        status: int | None,
+    ) -> None:
+        """Handle the response for the latest pending command on a device."""
+        if status is None:
+            return
+
+        pending_match = self._get_pending_device_command(transaction_id)
+        if pending_match is None:
+            return
+
+        device_guid, pending_command = pending_match
+        if status == 0:
+            pending_command["response_status"] = 0
+            if pending_command["optimistic_applied"]:
+                self._clear_pending_device_command(device_guid, transaction_id)
+            return
+
+        if status == 10:
+            pending_command["response_status"] = 10
+            _LOGGER.debug(
+                "Keeping optimistic %s for device %s after inconclusive timeout",
+                pending_command["command_kind"],
+                device_guid[-8:],
+            )
+            return
+
+        pending_command["response_status"] = status
+        if pending_command["optimistic_applied"]:
+            self._reconcile_failed_pending_command(device_guid, pending_command, status)
+            self._clear_pending_device_command(device_guid, transaction_id)
+
+    def _reconcile_failed_pending_command(
+        self,
+        device_guid: str,
+        pending_command: dict[str, Any],
+        status: int,
+    ) -> None:
+        """Reconcile a hard-failed command from the device's current state."""
         device_data = self.devices.get(device_guid)
         if device_data is None:
             return
 
-        device_data["movement_state"] = movement_snapshot.get("movement_state")
-        device_data["target_position"] = movement_snapshot.get("target_position")
-        device_data["movement_started_at"] = movement_snapshot.get("movement_started_at")
-
-    def _remember_pending_movement_command(
-        self,
-        transaction_id: str,
-        device_guid: str,
-        action: str,
-    ) -> None:
-        """Track an optimistic movement update until TR7 responds."""
-        self._pending_movement_commands[transaction_id] = {
-            "action": action,
-            "device_guid": device_guid,
-            "optimistic_applied": False,
-            "response_status": None,
-            "restore_state": self._copy_device_movement(self.devices.get(device_guid)),
-        }
-
-    def _record_pending_movement_response(
-        self,
-        transaction_id: str,
-        status: int | None,
-    ) -> None:
-        """Record the TR7 response for a tracked optimistic movement update."""
-        pending_command = self._pending_movement_commands.get(transaction_id)
-        if pending_command is None:
+        issued_at = pending_command["issued_at"]
+        if pending_command.get("movement_observed"):
+            _LOGGER.warning(
+                "Ignoring hard-failed %s for device %s because live movement was already observed",
+                pending_command["command_kind"],
+                device_guid[-8:],
+            )
             return
 
-        if status is None:
-            return
+        if pending_command.get("previous_movement_state") is not None:
+            device_data["movement_state"] = pending_command["previous_movement_state"]
+            device_data["target_position"] = pending_command["previous_target_position"]
+            previous_started_at = pending_command.get("previous_movement_started_at")
+            previous_freshness_at = pending_command.get("previous_last_position_change_at")
+            device_data["movement_started_at"] = (
+                previous_started_at
+                if isinstance(previous_started_at, datetime)
+                else issued_at
+            )
+            device_data["last_position_change_at"] = (
+                previous_freshness_at
+                if isinstance(previous_freshness_at, datetime)
+                else None
+            )
+        else:
+            self._clear_device_movement(device_data)
 
-        pending_command["response_status"] = status
-        if status == 0:
-            if pending_command["optimistic_applied"]:
-                self._pending_movement_commands.pop(transaction_id, None)
-            return
-
-        if pending_command["optimistic_applied"]:
-            self._rollback_pending_movement_command(transaction_id, status)
-
-    def _rollback_pending_movement_command(
-        self,
-        transaction_id: str,
-        status: int | None,
-    ) -> None:
-        """Rollback a rejected optimistic movement update."""
-        pending_command = self._pending_movement_commands.pop(transaction_id, None)
-        if pending_command is None:
-            return
-
-        if not pending_command["optimistic_applied"]:
-            return
-
-        device_guid = pending_command["device_guid"]
-        self._restore_device_movement(device_guid, pending_command["restore_state"])
         self._sync_device_movement_expiry(device_guid)
-
         _LOGGER.warning(
-            "Rolling back optimistic %s for device %s after TR7 response status %s",
-            pending_command["action"],
+            "Reconciled failed %s for device %s after TR7 response status %s",
+            pending_command["command_kind"],
             device_guid[-8:],
             status,
         )
@@ -242,8 +329,8 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             self._cancel_device_movement_expiry(device_guid)
             return
 
-        current_started_at = device_data.get("movement_started_at")
-        if current_started_at != expected_started_at:
+        current_freshness_at = self._movement_freshness_time(device_data)
+        if current_freshness_at != expected_started_at:
             self._sync_device_movement_expiry(device_guid)
             return
 
@@ -267,16 +354,16 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             return
 
         movement_state = device_data.get("movement_state")
-        started_at = device_data.get("movement_started_at")
-        if movement_state is None or not isinstance(started_at, datetime):
+        freshness_at = self._movement_freshness_time(device_data)
+        if movement_state is None or not isinstance(freshness_at, datetime):
             self._cancel_device_movement_expiry(device_guid)
             return
 
         delay = (
-            started_at + MOVEMENT_STATE_TIMEOUT - datetime.now()
+            freshness_at + MOVEMENT_STATE_TIMEOUT - datetime.now()
         ).total_seconds()
         if delay <= 0:
-            self._expire_device_movement(device_guid, started_at)
+            self._expire_device_movement(device_guid, freshness_at)
             return
 
         self._cancel_device_movement_expiry(device_guid)
@@ -284,7 +371,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             delay,
             self._expire_device_movement,
             device_guid,
-            started_at,
+            freshness_at,
         )
 
     def _sync_all_movement_expiry(self) -> None:
@@ -314,10 +401,10 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
 
     def _is_movement_state_stale(self, device_data: dict[str, Any]) -> bool:
         """Return if the optimistic movement state has gone stale."""
-        started_at = device_data.get("movement_started_at")
-        if not isinstance(started_at, datetime):
+        freshness_at = self._movement_freshness_time(device_data)
+        if not isinstance(freshness_at, datetime):
             return False
-        return datetime.now() - started_at > MOVEMENT_STATE_TIMEOUT
+        return datetime.now() - freshness_at > MOVEMENT_STATE_TIMEOUT
 
     def _refresh_device_movement_state(self, device_data: dict[str, Any]) -> None:
         """Clear any stale movement state before exposing device data."""
@@ -373,6 +460,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         device_data["target_position"] = target_position
         device_data["movement_state"] = movement_state
         device_data["movement_started_at"] = datetime.now()
+        device_data["last_position_change_at"] = None
 
     def _merge_device_state(
         self,
@@ -405,6 +493,11 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         current_position = self._tr7_to_ha_position(updated.get("position"))
         previous_ha_position = self._tr7_to_ha_position(previous_position)
         target_position = updated.get("target_position")
+        position_changed = (
+            previous_ha_position is not None
+            and current_position is not None
+            and current_position != previous_ha_position
+        )
 
         if self._movement_target_reached(
             updated.get("movement_state"),
@@ -417,17 +510,22 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         if (
             allow_delta_inference
             and
-            previous_ha_position is not None
-            and current_position is not None
-            and current_position != previous_ha_position
+            position_changed
         ):
+            observed_at = datetime.now()
             inferred_movement = (
                 MOVEMENT_OPENING
                 if current_position > previous_ha_position
                 else MOVEMENT_CLOSING
             )
             updated["movement_state"] = inferred_movement
-            updated["movement_started_at"] = datetime.now()
+            if not isinstance(updated.get("movement_started_at"), datetime):
+                updated["movement_started_at"] = observed_at
+            updated["last_position_change_at"] = observed_at
+            pending_command = self._pending_device_commands.get(device_guid)
+            if pending_command is not None:
+                pending_command["movement_observed"] = True
+            self._clear_pending_device_command(device_guid)
             if self._movement_target_reached(
                 inferred_movement,
                 current_position,
@@ -439,11 +537,13 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         if (
             not allow_delta_inference
             and updated.get("movement_state") is not None
-            and previous_ha_position is not None
-            and current_position is not None
-            and current_position != previous_ha_position
+            and position_changed
         ):
-            updated["movement_started_at"] = datetime.now()
+            updated["last_position_change_at"] = datetime.now()
+            pending_command = self._pending_device_commands.get(device_guid)
+            if pending_command is not None:
+                pending_command["movement_observed"] = True
+            self._clear_pending_device_command(device_guid)
             return updated
 
         self._refresh_device_movement_state(updated)
@@ -854,7 +954,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                         RESOURCE_DEVICE_POSITION,
                         RESOURCE_DEVICE_STOP,
                     }:
-                        self._record_pending_movement_response(transaction_id, status)
+                        self._handle_pending_command_response(transaction_id, status)
 
                     # Reset timeout count on successful device control commands
                     if resource in {RESOURCE_DEVICE_CONTROL, RESOURCE_DEVICE_POSITION, RESOURCE_DEVICE_STOP} and status == 0:
@@ -1070,32 +1170,41 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             )
 
             _LOGGER.info("Setting position for device %s to %s (channel %s)", device_guid, position, channel)
-            self._remember_pending_movement_command(
-                transaction_id,
+            self._remember_pending_device_command(
                 device_guid,
-                f"position command to {position}%",
+                transaction_id,
+                command_kind="move",
+                target_position=position,
             )
             try:
                 await self._send_device_control_message(message)
             except Exception:
-                self._pending_movement_commands.pop(transaction_id, None)
+                self._clear_pending_device_command(device_guid, transaction_id)
                 raise
 
-            pending_command = self._pending_movement_commands.get(transaction_id)
-            if pending_command is None:
+            pending_command = self._pending_device_commands.get(device_guid)
+            if (
+                pending_command is None
+                or pending_command.get("transaction_id") != transaction_id
+            ):
                 return
 
             response_status = pending_command.get("response_status")
-            if response_status not in (None, 0):
-                self._rollback_pending_movement_command(transaction_id, response_status)
+            if response_status not in (None, 0, 10):
+                self._reconcile_failed_pending_command(
+                    device_guid,
+                    pending_command,
+                    response_status,
+                )
+                self._clear_pending_device_command(device_guid, transaction_id)
                 return
 
             pending_command["optimistic_applied"] = True
             self._set_command_movement_state(device_guid, position)
             self._sync_device_movement_expiry(device_guid)
             self.async_set_updated_data(self.devices)
-            if pending_command.get("response_status") == 0:
-                self._pending_movement_commands.pop(transaction_id, None)
+            if response_status == 0:
+                self._clear_pending_device_command(device_guid, transaction_id)
 
         except Exception as err:
             _LOGGER.error("Error setting position for device %s: %s", device_guid, err)
@@ -1149,14 +1258,12 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         await self._ensure_connected_and_authenticated()
         try:
             await self._send_message(message)
-            await asyncio.sleep(0.5)
         except UpdateFailed as err:
             _LOGGER.warning("Device control command failed, attempting re-auth and retry: %s", err)
             self.authenticated = False
             self._last_auth_time = None
             await self._ensure_connected_and_authenticated()
             await self._send_message(message)
-            await asyncio.sleep(0.5)
         except Exception as err:
             _LOGGER.error("Failed to send device control command: %s", err)
             raise
@@ -1178,24 +1285,32 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
 
             _LOGGER.info("Stopping device %s (channel %s)", device_guid[-8:], channel)
             _LOGGER.debug("Stop command: %s", message)
-            self._remember_pending_movement_command(
-                transaction_id,
+            self._remember_pending_device_command(
                 device_guid,
-                "stop command",
+                transaction_id,
+                command_kind="stop",
             )
             try:
                 await self._send_device_control_message(message)
             except Exception:
-                self._pending_movement_commands.pop(transaction_id, None)
+                self._clear_pending_device_command(device_guid, transaction_id)
                 raise
 
-            pending_command = self._pending_movement_commands.get(transaction_id)
-            if pending_command is None:
+            pending_command = self._pending_device_commands.get(device_guid)
+            if (
+                pending_command is None
+                or pending_command.get("transaction_id") != transaction_id
+            ):
                 return
 
             response_status = pending_command.get("response_status")
-            if response_status not in (None, 0):
-                self._rollback_pending_movement_command(transaction_id, response_status)
+            if response_status not in (None, 0, 10):
+                self._reconcile_failed_pending_command(
+                    device_guid,
+                    pending_command,
+                    response_status,
+                )
+                self._clear_pending_device_command(device_guid, transaction_id)
                 return
 
             pending_command["optimistic_applied"] = True
@@ -1204,8 +1319,8 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                 self._clear_device_movement(device_data)
                 self._sync_device_movement_expiry(device_guid)
                 self.async_set_updated_data(self.devices)
-            if pending_command.get("response_status") == 0:
-                self._pending_movement_commands.pop(transaction_id, None)
+            if response_status == 0:
+                self._clear_pending_device_command(device_guid, transaction_id)
         except Exception as err:
             _LOGGER.error("Error stopping cover for device %s: %s", device_guid, err)
             raise
@@ -1248,7 +1363,8 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
 
         for device_guid in list(self._movement_expiry_handles):
             self._cancel_device_movement_expiry(device_guid)
-        self._pending_movement_commands.clear()
+        self._pending_device_commands.clear()
+        self._pending_command_devices.clear()
 
         if self.websocket:
             try:
