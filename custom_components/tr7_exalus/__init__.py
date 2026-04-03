@@ -44,7 +44,7 @@ _LOGGER = logging.getLogger(__name__)
 PLATFORMS = [Platform.COVER]
 MOVEMENT_OPENING = "opening"
 MOVEMENT_CLOSING = "closing"
-MOVEMENT_STATE_TIMEOUT = timedelta(seconds=90)
+MOVEMENT_STATE_TIMEOUT = timedelta(seconds=30)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -102,6 +102,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         self._last_command_time: datetime | None = None
         self._command_delay = 0.5  # 500ms base delay between commands
         self._timeout_count = 0
+        self._movement_expiry_handles: dict[str, asyncio.TimerHandle] = {}
 
         # Session health monitoring
         self._session_start_time: datetime | None = None
@@ -130,6 +131,78 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         device_data["movement_state"] = None
         device_data["target_position"] = None
         device_data["movement_started_at"] = None
+
+    def _cancel_device_movement_expiry(self, device_guid: str) -> None:
+        """Cancel any pending movement expiry callback for a device."""
+        expiry_handle = self._movement_expiry_handles.pop(device_guid, None)
+        if expiry_handle is not None:
+            expiry_handle.cancel()
+
+    def _expire_device_movement(
+        self,
+        device_guid: str,
+        expected_started_at: datetime,
+    ) -> None:
+        """Clear stale movement state and publish the update."""
+        device_data = self.devices.get(device_guid)
+        if device_data is None:
+            self._cancel_device_movement_expiry(device_guid)
+            return
+
+        current_started_at = device_data.get("movement_started_at")
+        if current_started_at != expected_started_at:
+            self._sync_device_movement_expiry(device_guid)
+            return
+
+        if not self._is_movement_state_stale(device_data):
+            self._sync_device_movement_expiry(device_guid)
+            return
+
+        _LOGGER.debug(
+            "Movement state timeout expired for device %s",
+            device_data.get("guid", "unknown"),
+        )
+        self._clear_device_movement(device_data)
+        self._cancel_device_movement_expiry(device_guid)
+        self.async_set_updated_data(self.devices)
+
+    def _sync_device_movement_expiry(self, device_guid: str) -> None:
+        """Ensure a device's movement expiry callback matches current state."""
+        device_data = self.devices.get(device_guid)
+        if device_data is None:
+            self._cancel_device_movement_expiry(device_guid)
+            return
+
+        movement_state = device_data.get("movement_state")
+        started_at = device_data.get("movement_started_at")
+        if movement_state is None or not isinstance(started_at, datetime):
+            self._cancel_device_movement_expiry(device_guid)
+            return
+
+        delay = (
+            started_at + MOVEMENT_STATE_TIMEOUT - datetime.now()
+        ).total_seconds()
+        if delay <= 0:
+            self._expire_device_movement(device_guid, started_at)
+            return
+
+        self._cancel_device_movement_expiry(device_guid)
+        self._movement_expiry_handles[device_guid] = self.hass.loop.call_later(
+            delay,
+            self._expire_device_movement,
+            device_guid,
+            started_at,
+        )
+
+    def _sync_all_movement_expiry(self) -> None:
+        """Reconcile all movement expiry callbacks with current devices."""
+        active_device_guids = set(self.devices)
+        for device_guid in list(self._movement_expiry_handles):
+            if device_guid not in active_device_guids:
+                self._cancel_device_movement_expiry(device_guid)
+
+        for device_guid in active_device_guids:
+            self._sync_device_movement_expiry(device_guid)
 
     @staticmethod
     def _movement_target_reached(
@@ -166,12 +239,8 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             self._clear_device_movement(device_data)
 
     def get_device_data(self, device_guid: str) -> dict[str, Any] | None:
-        """Return device data with derived movement state refreshed."""
-        device_data = self.devices.get(device_guid)
-        if device_data is None:
-            return None
-        self._refresh_device_movement_state(device_data)
-        return device_data
+        """Return device data for a device."""
+        return self.devices.get(device_guid)
 
     def get_cover_movement_state(self, device_guid: str) -> str | None:
         """Return the derived Home Assistant movement state for a cover."""
@@ -788,6 +857,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                 )
 
             self.devices = new_devices
+            self._sync_all_movement_expiry()
 
             # Notify listeners of new device data
             self.async_set_updated_data(self.devices)
@@ -818,6 +888,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                 state,
                 allow_delta_inference=True,
             )
+            self._sync_device_movement_expiry(device_guid)
 
             # Reset empty list counter when a state change arrives
             self._empty_device_states = 0
@@ -888,6 +959,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             # Start with the most likely working endpoint based on TR7 traffic analysis
             await self._send_position_command(device_guid, position, channel)
             self._set_command_movement_state(device_guid, position)
+            self._sync_device_movement_expiry(device_guid)
             self.async_set_updated_data(self.devices)
 
         except Exception as err:
@@ -985,6 +1057,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             device_data = self.devices.get(device_guid)
             if device_data is not None:
                 self._clear_device_movement(device_data)
+                self._sync_device_movement_expiry(device_guid)
                 self.async_set_updated_data(self.devices)
 
         except UpdateFailed as err:
@@ -996,6 +1069,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             device_data = self.devices.get(device_guid)
             if device_data is not None:
                 self._clear_device_movement(device_data)
+                self._sync_device_movement_expiry(device_guid)
                 self.async_set_updated_data(self.devices)
         except Exception as err:
             _LOGGER.error("Error stopping cover for device %s: %s", device_guid, err)
@@ -1016,6 +1090,9 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                 await self._auth_refresh_task
             except asyncio.CancelledError:
                 pass
+
+        for device_guid in list(self._movement_expiry_handles):
+            self._cancel_device_movement_expiry(device_guid)
 
         if self.websocket:
             try:
