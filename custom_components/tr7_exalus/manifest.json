@@ -1,14 +1,14 @@
 {
   "domain": "tr7_exalus",
-  "name": "TR7 Exalus Blind Control",
-  "codeowners": ["@user"],
+  "name": "PK TR7 Exalus Blind Control",
+  "codeowners": ["@pkosiec"],
   "config_flow": true,
-  "documentation": "https://github.com/krystaDev/home-assistant-tr7-exalus",
-  "issue_tracker": "https://github.com/krystaDev/home-assistant-tr7-exalus/issues",
+  "documentation": "https://github.com/pkosiec/home-assistant-tr7-exalus",
+  "issue_tracker": "https://github.com/pkosiec/home-assistant-tr7-exalus/issues",
   "integration_type": "hub",
   "iot_class": "local_push",
   "requirements": ["websockets>=12.0"],
-  "version": "1.0.1",
+  "version": "1.1.0",
   "dependencies": [],
   "zeroconf": []
 }
