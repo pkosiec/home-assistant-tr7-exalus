@@ -131,6 +131,21 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         device_data["target_position"] = None
         device_data["movement_started_at"] = None
 
+    @staticmethod
+    def _movement_target_reached(
+        movement_state: str | None,
+        current_position: int | None,
+        target_position: int | None,
+    ) -> bool:
+        """Return whether a movement has reached or passed its target."""
+        if current_position is None or target_position is None:
+            return False
+        if movement_state == MOVEMENT_OPENING:
+            return current_position >= target_position
+        if movement_state == MOVEMENT_CLOSING:
+            return current_position <= target_position
+        return current_position == target_position
+
     def _is_movement_state_stale(self, device_data: dict[str, Any]) -> bool:
         """Return if the optimistic movement state has gone stale."""
         started_at = device_data.get("movement_started_at")
@@ -203,6 +218,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         state: dict[str, Any],
         *,
         existing: dict[str, Any] | None = None,
+        allow_delta_inference: bool = True,
     ) -> dict[str, Any]:
         """Merge TR7 device state while preserving derived movement metadata."""
         previous_data = existing or self.devices.get(device_guid, {})
@@ -228,11 +244,17 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
         previous_ha_position = self._tr7_to_ha_position(previous_position)
         target_position = updated.get("target_position")
 
-        if target_position is not None and current_position == target_position:
+        if self._movement_target_reached(
+            updated.get("movement_state"),
+            current_position,
+            target_position,
+        ):
             self._clear_device_movement(updated)
             return updated
 
         if (
+            allow_delta_inference
+            and
             previous_ha_position is not None
             and current_position is not None
             and current_position != previous_ha_position
@@ -244,14 +266,12 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             )
             updated["movement_state"] = inferred_movement
             updated["movement_started_at"] = datetime.now()
-            if (
-                target_position is not None
-                and (
-                    (inferred_movement == MOVEMENT_OPENING and current_position > target_position)
-                    or (inferred_movement == MOVEMENT_CLOSING and current_position < target_position)
-                )
+            if self._movement_target_reached(
+                inferred_movement,
+                current_position,
+                target_position,
             ):
-                updated["target_position"] = None
+                self._clear_device_movement(updated)
             return updated
 
         self._refresh_device_movement_state(updated)
@@ -755,18 +775,19 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                             device_guid,
                             device_info,
                             existing=self.devices.get(device_guid),
+                            allow_delta_inference=False,
                         )
                         _LOGGER.info("Added device: %s (position: %s)", device_guid[-8:], device_info.get("Position", 0))
 
             missing_devices = set(self.devices) - set(new_devices)
             if missing_devices:
                 _LOGGER.debug(
-                    "Preserving %d devices missing from this snapshot: %s",
+                    "Pruning %d devices missing from this snapshot: %s",
                     len(missing_devices),
                     [device_guid[-8:] for device_guid in missing_devices],
                 )
 
-            self.devices.update(new_devices)
+            self.devices = new_devices
 
             # Notify listeners of new device data
             self.async_set_updated_data(self.devices)
@@ -792,7 +813,11 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                 return
 
             # Update device state
-            self.devices[device_guid] = self._merge_device_state(device_guid, state)
+            self.devices[device_guid] = self._merge_device_state(
+                device_guid,
+                state,
+                allow_delta_inference=True,
+            )
 
             # Reset empty list counter when a state change arrives
             self._empty_device_states = 0
