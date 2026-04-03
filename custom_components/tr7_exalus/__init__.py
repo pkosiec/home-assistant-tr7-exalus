@@ -42,6 +42,9 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.COVER]
+MOVEMENT_OPENING = "opening"
+MOVEMENT_CLOSING = "closing"
+MOVEMENT_STATE_TIMEOUT = timedelta(seconds=90)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -114,6 +117,145 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             name=DOMAIN,
             update_interval=timedelta(seconds=30),  # Health check every 30 seconds
         )
+
+    @staticmethod
+    def _tr7_to_ha_position(position: int | None) -> int | None:
+        """Convert a TR7 position to the Home Assistant cover scale."""
+        if position is None:
+            return None
+        return 100 - position
+
+    def _clear_device_movement(self, device_data: dict[str, Any]) -> None:
+        """Clear derived movement metadata for a device."""
+        device_data["movement_state"] = None
+        device_data["target_position"] = None
+        device_data["movement_started_at"] = None
+
+    def _is_movement_state_stale(self, device_data: dict[str, Any]) -> bool:
+        """Return if the optimistic movement state has gone stale."""
+        started_at = device_data.get("movement_started_at")
+        if not isinstance(started_at, datetime):
+            return False
+        return datetime.now() - started_at > MOVEMENT_STATE_TIMEOUT
+
+    def _refresh_device_movement_state(self, device_data: dict[str, Any]) -> None:
+        """Clear any stale movement state before exposing device data."""
+        if (
+            device_data.get("movement_state") is not None
+            and self._is_movement_state_stale(device_data)
+        ):
+            _LOGGER.debug(
+                "Clearing stale movement state for device %s",
+                device_data.get("guid", "unknown"),
+            )
+            self._clear_device_movement(device_data)
+
+    def get_device_data(self, device_guid: str) -> dict[str, Any] | None:
+        """Return device data with derived movement state refreshed."""
+        device_data = self.devices.get(device_guid)
+        if device_data is None:
+            return None
+        self._refresh_device_movement_state(device_data)
+        return device_data
+
+    def get_cover_movement_state(self, device_guid: str) -> str | None:
+        """Return the derived Home Assistant movement state for a cover."""
+        device_data = self.get_device_data(device_guid)
+        if device_data is None:
+            return None
+        return device_data.get("movement_state")
+
+    def _set_command_movement_state(
+        self,
+        device_guid: str,
+        target_position: int | None,
+    ) -> None:
+        """Set optimistic movement state after a command is sent."""
+        device_data = self.devices.get(device_guid)
+        if device_data is None:
+            return
+
+        current_position = self._tr7_to_ha_position(device_data.get("position"))
+        movement_state = None
+
+        if current_position is None:
+            if target_position == 100:
+                movement_state = MOVEMENT_OPENING
+            elif target_position == 0:
+                movement_state = MOVEMENT_CLOSING
+        elif target_position is not None:
+            if target_position > current_position:
+                movement_state = MOVEMENT_OPENING
+            elif target_position < current_position:
+                movement_state = MOVEMENT_CLOSING
+
+        if movement_state is None:
+            self._clear_device_movement(device_data)
+            return
+
+        device_data["target_position"] = target_position
+        device_data["movement_state"] = movement_state
+        device_data["movement_started_at"] = datetime.now()
+
+    def _merge_device_state(
+        self,
+        device_guid: str,
+        state: dict[str, Any],
+        *,
+        existing: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Merge TR7 device state while preserving derived movement metadata."""
+        previous_data = existing or self.devices.get(device_guid, {})
+        previous_position = previous_data.get("position")
+        updated: dict[str, Any] = {
+            **previous_data,
+            "guid": device_guid,
+            "position": state.get("Position", previous_data.get("position", 0)),
+            "raw_position": state.get("RawPosition", previous_data.get("raw_position", 0)),
+            "channel": state.get("Channel", previous_data.get("channel", 1)),
+            "time": state.get("Time", previous_data.get("time")),
+            "reliability": state.get(
+                "StateReliability",
+                previous_data.get("reliability", 0),
+            ),
+            "name": state.get(
+                "Name",
+                previous_data.get("name", f"TR7 Blind {device_guid[-8:]}"),
+            ),
+        }
+
+        current_position = self._tr7_to_ha_position(updated.get("position"))
+        previous_ha_position = self._tr7_to_ha_position(previous_position)
+        target_position = updated.get("target_position")
+
+        if target_position is not None and current_position == target_position:
+            self._clear_device_movement(updated)
+            return updated
+
+        if (
+            previous_ha_position is not None
+            and current_position is not None
+            and current_position != previous_ha_position
+        ):
+            inferred_movement = (
+                MOVEMENT_OPENING
+                if current_position > previous_ha_position
+                else MOVEMENT_CLOSING
+            )
+            updated["movement_state"] = inferred_movement
+            updated["movement_started_at"] = datetime.now()
+            if (
+                target_position is not None
+                and (
+                    (inferred_movement == MOVEMENT_OPENING and current_position > target_position)
+                    or (inferred_movement == MOVEMENT_CLOSING and current_position < target_position)
+                )
+            ):
+                updated["target_position"] = None
+            return updated
+
+        self._refresh_device_movement_state(updated)
+        return updated
 
     def _is_websocket_connected(self) -> bool:
         """Check if WebSocket is connected."""
@@ -601,25 +743,30 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             # Reset timeout count on successful device discovery
             self._timeout_count = 0
 
-            # Clear existing devices and repopulate
-            self.devices.clear()
+            # Merge newly reported devices while preserving derived movement metadata
+            new_devices: dict[str, dict[str, Any]] = {}
 
             for device_info in device_list:
                 if isinstance(device_info, dict):
                     device_guid = device_info.get("DeviceGuid") or device_info.get("Guid")
 
                     if device_guid:
-                        # Initialize device with available info
-                        self.devices[device_guid] = {
-                            "guid": device_guid,
-                            "position": device_info.get("Position", 0),
-                            "raw_position": device_info.get("RawPosition", 0),
-                            "channel": device_info.get("Channel", 1),
-                            "time": device_info.get("Time"),
-                            "reliability": device_info.get("StateReliability", 0),
-                            "name": device_info.get("Name", f"TR7 Blind {device_guid[-8:]}")
-                        }
+                        new_devices[device_guid] = self._merge_device_state(
+                            device_guid,
+                            device_info,
+                            existing=self.devices.get(device_guid),
+                        )
                         _LOGGER.info("Added device: %s (position: %s)", device_guid[-8:], device_info.get("Position", 0))
+
+            missing_devices = set(self.devices) - set(new_devices)
+            if missing_devices:
+                _LOGGER.debug(
+                    "Preserving %d devices missing from this snapshot: %s",
+                    len(missing_devices),
+                    [device_guid[-8:] for device_guid in missing_devices],
+                )
+
+            self.devices.update(new_devices)
 
             # Notify listeners of new device data
             self.async_set_updated_data(self.devices)
@@ -645,14 +792,7 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
                 return
 
             # Update device state
-            self.devices[device_guid] = {
-                "guid": device_guid,
-                "position": state.get("Position", 0),
-                "raw_position": state.get("RawPosition", 0),
-                "channel": state.get("Channel", 0),
-                "time": state.get("Time"),
-                "reliability": state.get("StateReliability", 0)
-            }
+            self.devices[device_guid] = self._merge_device_state(device_guid, state)
 
             # Reset empty list counter when a state change arrives
             self._empty_device_states = 0
@@ -722,6 +862,8 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
 
             # Start with the most likely working endpoint based on TR7 traffic analysis
             await self._send_position_command(device_guid, position, channel)
+            self._set_command_movement_state(device_guid, position)
+            self.async_set_updated_data(self.devices)
 
         except Exception as err:
             _LOGGER.error("Error setting position for device %s: %s", device_guid, err)
@@ -815,6 +957,10 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             _LOGGER.info("Stopping device %s (channel %s)", device_guid[-8:], channel)
             _LOGGER.debug("Stop command: %s", message)
             await self._send_message(message)
+            device_data = self.devices.get(device_guid)
+            if device_data is not None:
+                self._clear_device_movement(device_data)
+                self.async_set_updated_data(self.devices)
 
         except UpdateFailed as err:
             _LOGGER.warning("Stop command failed, attempting re-auth and retry: %s", err)
@@ -822,6 +968,10 @@ class TR7ExalusCoordinator(DataUpdateCoordinator):
             self._last_auth_time = None
             await self._ensure_connected_and_authenticated()
             await self._send_message(message)
+            device_data = self.devices.get(device_guid)
+            if device_data is not None:
+                self._clear_device_movement(device_data)
+                self.async_set_updated_data(self.devices)
         except Exception as err:
             _LOGGER.error("Error stopping cover for device %s: %s", device_guid, err)
             raise

@@ -5,6 +5,7 @@ A custom Home Assistant integration for controlling TR7 Exalus smart blinds via 
 ## Features
 
 - Real-time blind position control
+- Native Home Assistant opening/closing movement states
 - WebSocket-based communication for instant updates
 - Support for multiple blinds
 - Open, close, stop, and set position commands
@@ -46,6 +47,7 @@ Once configured, your blinds will appear as cover entities in Home Assistant. Yo
 - **Close**: Set blinds to fully closed position
 - **Stop**: Stop blind movement
 - **Set Position**: Set blinds to a specific position (0-100%)
+- **Observe Movement**: Use Home Assistant's `opening` and `closing` cover states in dashboards and automations
 
 ### Example Automation
 
@@ -123,7 +125,6 @@ logger:
 ## Known Limitations
 
 - Position reporting may be inverted (TR7 uses 0=open, HA expects 0=closed)
-- Movement state detection (opening/closing) not yet implemented
 - Device names are auto-generated from device GUID
 
 ## Contributing

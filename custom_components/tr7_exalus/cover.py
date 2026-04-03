@@ -132,7 +132,7 @@ class TR7ExalusCover(CoordinatorEntity, CoverEntity):
 
         None is unknown, 0 is closed, 100 is fully open.
         """
-        device_data = self.coordinator.devices.get(self._device_guid)
+        device_data = self.coordinator.get_device_data(self._device_guid)
         if device_data is None:
             return None
 
@@ -152,16 +152,12 @@ class TR7ExalusCover(CoordinatorEntity, CoverEntity):
     @property
     def is_opening(self) -> bool:
         """Return if the cover is opening."""
-        # This would require tracking movement state from TR7
-        # For now, we'll return False as we don't have this info
-        return False
+        return self.coordinator.get_cover_movement_state(self._device_guid) == "opening"
 
     @property
     def is_closing(self) -> bool:
         """Return if the cover is closing."""
-        # This would require tracking movement state from TR7
-        # For now, we'll return False as we don't have this info
-        return False
+        return self.coordinator.get_cover_movement_state(self._device_guid) == "closing"
 
     async def async_open_cover(self, **kwargs: Any) -> None:
         """Open the cover."""
@@ -238,11 +234,13 @@ class TR7ExalusCover(CoordinatorEntity, CoverEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return additional state attributes."""
-        device_data = self.coordinator.devices.get(self._device_guid, {})
+        device_data = self.coordinator.get_device_data(self._device_guid) or {}
         return {
             "device_guid": self._device_guid,
             "raw_position": device_data.get("raw_position"),
             "channel": device_data.get("channel"),
             "last_update": device_data.get("time"),
             "reliability": device_data.get("reliability"),
+            "movement_state": device_data.get("movement_state"),
+            "target_position": device_data.get("target_position"),
         }
